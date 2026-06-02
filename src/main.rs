@@ -3,57 +3,77 @@ use axum::{
     routing::{ get, post, put, delete },
     Json, Router,
 };
-
+use sqlx::{ sqlite::SqlitePool, FromRow };
 use serde::{Serialize, Deserialize};
-use std::sync::{Arc, RwLock};
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, FromRow)]
 struct Todo {
-    id: u64,
+    id: i64,
     text: String,
 }
 
-type Db = Arc<RwLock<Vec<Todo>>>;
-
 #[tokio::main]
-async fn main() {
-    let shared_state: Db = Arc::new(RwLock::new(Vec::new()));
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool = SqlitePool::connect(&db_url).await?;
+
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     let app: Router = Router::new()
         .route("/todos", get(get_todos).post(add_todo))
         .route("/todos/{id}", put(update_todo).delete(delete_todo))
-        .with_state(shared_state);
+        .with_state(pool);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-
     println!("Server started at http://0.0.0.0:3000");
+    axum::serve(listener, app).await.unwrap();
 
-    axum::serve(listener, app).await.unwrap()
+    Ok(())
 }
 
-async fn get_todos(State(db): State<Db>) -> Json<Vec<Todo>> {
-    let todos = db.read().unwrap();
+async fn get_todos(State(pool): State<SqlitePool>) -> Json<Vec<Todo>> {
+    let todos = sqlx::query_as::<_, Todo>("SELECT id, text FROM todos")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
     Json(todos.clone())
 }
 
-async fn add_todo(State(db): State<Db>, Json(todo): Json<Todo>) -> Json<Todo> {
-    let mut todos = db.write().unwrap();
-    todos.push(todo.clone());
-    Json(todo)
+async fn add_todo(State(pool): State<SqlitePool>, Json(payload): Json<Todo>) -> Json<Todo> {
+    let result = sqlx::query!("INSERT INTO todos (text) VALUES (?)", payload.text)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let id = result.last_insert_rowid();
+    Json(Todo {
+        id,
+        text: payload.text
+    })
 }
 
-async fn update_todo(State(db): State<Db>, Path(id): Path<u64>, Json(payload): Json<Todo>) -> &'static str {
-    let mut todos = db.write().unwrap();
-    if let Some(todo) = todos.iter_mut().find(|t| t.id == id) {
-        todo.text = payload.text;
+async fn update_todo(State(pool): State<SqlitePool>, Path(id): Path<i64>, Json(payload): Json<Todo>) -> &'static str {
+    let result = sqlx::query!("UPDATE todos SET text = ? WHERE id = ?", payload.text, id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    if result.rows_affected() > 0 {
         "Updated"
     } else {
         "Not found"
     }
 }
 
-async fn delete_todo(State(db): State<Db>, Path(id): Path<u64>) -> &'static str {
-    let mut todos = db.write().unwrap();
-    todos.retain(|t| t.id != id);
-    "Deleted"
+async fn delete_todo(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> &'static str {
+    let result = sqlx::query!("DELETE FROM todos WHERE id = ?", id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    if result.rows_affected() > 0 {
+        "Deleted"
+    } else {
+        "Not found"
+    }
 }
